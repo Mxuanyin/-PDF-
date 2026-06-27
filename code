@@ -1,0 +1,160 @@
+import os
+import yaml
+import queue
+from PIL import Image
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# DPI 适配
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
+def sorted_numeric_filenames(file_list):
+    def extract_number(s):
+        basename = os.path.basename(s)
+        name, _ = os.path.splitext(basename)
+        return int(''.join(filter(str.isdigit, name)) or 0)
+    return sorted(file_list, key=extract_number)
+
+class Image2PdfGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("批量合成PDF工具")
+        self.root.geometry("700x580")
+        
+        self.log_queue = queue.Queue(maxsize=500)
+        self.executor = None
+        self.is_running = False
+        
+        self.total_discovered = 0
+        self.success_count = 0
+        self.finished_tasks = 0
+        self.counter_lock = threading.Lock()
+        
+        # 输入路径
+        tk.Label(root, text="当前输入路径 (扫描目录及子级文件夹):", font=("Microsoft YaHei", 10)).pack(anchor="w", padx=15, pady=(15, 2))
+        self.frame_dir = tk.Frame(root)
+        self.frame_dir.pack(fill="x", padx=15, pady=2)
+        self.entry_path = tk.Entry(self.frame_dir, font=("Arial", 10))
+        self.entry_path.pack(side="left", fill="x", expand=True, ipady=4)
+        tk.Button(self.frame_dir, text="浏览...", command=self.browse_folder, width=10).pack(side="right", padx=(5, 0))
+        
+        # 输出路径
+        tk.Label(root, text="当前输出路径 (留空默认输出父级文件夹):", font=("Microsoft YaHei", 10)).pack(anchor="w", padx=15, pady=(15, 2))
+        self.frame_out_dir = tk.Frame(root)
+        self.frame_out_dir.pack(fill="x", padx=15, pady=2)
+        self.entry_out_path = tk.Entry(self.frame_out_dir, font=("Arial", 10))
+        self.entry_out_path.pack(side="left", fill="x", expand=True, ipady=4)
+        tk.Button(self.frame_out_dir, text="浏览...", command=self.browse_output_folder, width=10).pack(side="right", padx=(5, 0))
+        
+        # 按钮
+        self.btn_start = tk.Button(root, text="开始转换", bg="#107c41", fg="white", font=("Microsoft YaHei", 11, "bold"), command=self.start_process_thread)
+        self.btn_start.pack(fill="x", padx=15, pady=20)
+        
+        # 日志
+        tk.Label(root, text="运行日志:", font=("Microsoft YaHei", 10)).pack(anchor="w", padx=15, pady=(5, 2))
+        self.log_box = ScrolledText(root, font=("Consolas", 10), bg="#f8f9fa", wrap=tk.WORD)
+        self.log_box.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        self.update_gui_loop()
+
+    def browse_folder(self):
+        p = filedialog.askdirectory()
+        if p: self.entry_path.delete(0, tk.END); self.entry_path.insert(0, p)
+
+    def browse_output_folder(self):
+        p = filedialog.askdirectory()
+        if p: self.entry_out_path.delete(0, tk.END); self.entry_out_path.insert(0, p)
+
+    def log(self, text):
+        try: self.log_queue.put_nowait(text)
+        except: pass 
+
+    def update_gui_loop(self):
+        lines = []
+        while len(lines) < 30:
+            try: lines.append(self.log_queue.get_nowait())
+            except: break
+        if lines:
+            self.log_box.insert(tk.END, "\n".join(lines) + "\n")
+            self.log_box.see(tk.END)
+            
+        if self.is_running:
+            with self.counter_lock:
+                if self.finished_tasks == self.total_discovered and self.total_discovered > 0:
+                    self.is_running = False
+                    self.log_box.insert(tk.END, f"\n完成！成功合并 {self.success_count} 个文件。\n")
+                    self.log_box.see(tk.END)
+                    messagebox.showinfo("完成", f"已完成 {self.success_count} 个 PDF 合并。")
+                    self.btn_start.config(state="normal")
+        self.root.after(80, self.update_gui_loop)
+
+    def start_process_thread(self):
+        self.btn_start.config(state="disabled")
+        self.total_discovered = 0
+        self.success_count = 0
+        self.finished_tasks = 0
+        self.is_running = True
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        threading.Thread(target=self.process, daemon=True).start()
+
+    def task_done_callback(self, future):
+        with self.counter_lock:
+            self.finished_tasks += 1
+            res, folder_name = future.result()
+            if res:
+                self.success_count += 1
+                self.log(f"已完成: {folder_name}")
+
+    def convert_single_folder(self, folder_path, pdf_path, name):
+        try:
+            files = [f for f in os.listdir(folder_path) if os.path.splitext(f)[1].lower() in {'.jpg', '.png', '.webp', '.bmp'}]
+            if not files: return False, name
+            files = sorted_numeric_filenames(files)
+            
+            def stream():
+                for p in files:
+                    with Image.open(os.path.join(folder_path, p)) as img:
+                        yield img.convert('RGB')
+            
+            imgs = stream()
+            first = next(imgs)
+            first.save(pdf_path, "PDF", save_all=True, append_images=imgs)
+            return True, name
+        except: return False, name
+
+    def process(self):
+        target_dir = self.entry_path.get().strip()
+        out_dir = self.entry_out_path.get().strip() or os.path.dirname(target_dir)
+        
+        if not os.path.exists(target_dir):
+            self.root.after(0, lambda: [messagebox.showerror("错误", "路径不存在"), self.btn_start.config(state="normal")])
+            return
+
+        self.log("开始运行...")
+        
+        tasks = []
+        for entry in os.scandir(target_dir):
+            if entry.is_dir():
+                pdf_path = os.path.join(out_dir, f"{entry.name}.pdf")
+                if not os.path.exists(pdf_path):
+                    self.total_discovered += 1
+                    f = self.executor.submit(self.convert_single_folder, entry.path, pdf_path, entry.name)
+                    f.add_done_callback(self.task_done_callback)
+
+        if self.total_discovered > 0:
+            self.log(f"扫到 {self.total_discovered} 个文件夹，开始合并：")
+        else:
+            self.log("未发现可合并的子文件夹。")
+            self.root.after(0, lambda: self.btn_start.config(state="normal"))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = Image2PdfGUI(root)
+    root.mainloop()
